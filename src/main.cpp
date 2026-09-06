@@ -16,6 +16,7 @@
 #include <WiFi.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <esp_wpa2.h>
 
 Preferences preferences;
 
@@ -177,10 +178,15 @@ static String servoStateJson() {
 // WiFi credentials: set via Serial, NVS, or SD card
 String wifi_ssid = "";
 String wifi_pass = "";
+// Both empty selects the PSK path; either one set selects PEAP/MSCHAPv2.
+String wifi_identity = "";
+String wifi_username = "";
 
 // Forward declarations for WiFi credential management
-void saveWiFiCredentials(const String& ssid, const String& pass);
+void saveWiFiCredentials();
 void clearWiFiCredentials();
+void beginWiFiConnect();
+void connectAndReport();
 
 // ---- Audio ----
 static constexpr uint8_t m5spk_virtual_channel = 0;
@@ -675,9 +681,40 @@ void handleSerialCommand(const String& cmd) {
 #endif
 #endif
 
+  } else if (cmd == "WIFI:STATUS") {
+    Serial.printf("{\"ssid\":\"%s\",\"auth\":\"%s\",\"identity\":\"%s\",\"has_password\":%s,"
+                  "\"connected\":%s,\"ip\":\"%s\"}\n",
+                  wifi_ssid.c_str(),
+                  (wifi_identity.isEmpty() && wifi_username.isEmpty()) ? "psk" : "eap",
+                  wifi_username.isEmpty() ? wifi_identity.c_str() : wifi_username.c_str(),
+                  wifi_pass.isEmpty() ? "false" : "true",
+                  WiFi.status() == WL_CONNECTED ? "true" : "false",
+                  WiFi.localIP().toString().c_str());
+
   } else if (cmd == "WIFI:CLEAR") {
     clearWiFiCredentials();
     Serial.println("{\"status\":\"ok\",\"message\":\"wifi credentials cleared\"}");
+
+  } else if (cmd.startsWith("WIFI:EAP:")) {
+    // WIFI:EAP:ssid:identity:username:password
+    // Only the password may contain ':'; an empty identity reuses the username.
+    int p1 = cmd.indexOf(':', 9);
+    int p2 = p1 > 0 ? cmd.indexOf(':', p1 + 1) : -1;
+    int p3 = p2 > 0 ? cmd.indexOf(':', p2 + 1) : -1;
+    if (p3 > 0) {
+      wifi_ssid = cmd.substring(9, p1);
+      wifi_identity = cmd.substring(p1 + 1, p2);
+      wifi_username = cmd.substring(p2 + 1, p3);
+      wifi_pass = cmd.substring(p3 + 1);
+      wifi_ssid.trim();
+      wifi_identity.trim();
+      wifi_username.trim();
+      wifi_pass.trim();
+      connectAndReport();
+    } else {
+      Serial.println("{\"status\":\"error\","
+                     "\"error\":\"usage: WIFI:EAP:ssid:identity:username:password\"}");
+    }
 
   } else if (cmd.startsWith("WIFI:")) {
     // WIFI:ssid:password
@@ -687,30 +724,9 @@ void handleSerialCommand(const String& cmd) {
       wifi_pass = cmd.substring(first_colon + 1);
       wifi_ssid.trim();
       wifi_pass.trim();
-      Serial.println("{\"status\":\"connecting\"}");
-      avatar.setSpeechText("WiFi接続中...");
-      WiFi.mode(WIFI_STA);
-      WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
-      int retry = 0;
-      while (WiFi.status() != WL_CONNECTED && retry < 20) {
-        delay(500);
-        retry++;
-      }
-      if (WiFi.status() == WL_CONNECTED) {
-        wifi_connected = true;
-        WiFi.setSleep(false);  // Disable WiFi power saving for lower latency
-        saveWiFiCredentials(wifi_ssid, wifi_pass);
-        server.begin();
-        Serial.printf("{\"status\":\"ok\",\"ip\":\"%s\"}\n", WiFi.localIP().toString().c_str());
-        avatar.setSpeechText(WiFi.localIP().toString().c_str());
-        delay(2000);
-        avatar.setSpeechText("");
-      } else {
-        Serial.println("{\"status\":\"error\",\"error\":\"wifi connection failed\"}");
-        avatar.setSpeechText("WiFi失敗");
-        delay(1000);
-        avatar.setSpeechText("");
-      }
+      wifi_identity = "";
+      wifi_username = "";
+      connectAndReport();
     }
 
   } else if (cmd == "CAPTURE") {
@@ -878,12 +894,58 @@ void handleCaptureHTTP(AsyncWebServerRequest *request) {
 #endif
 
 // ---- WiFi Setup ----
-void saveWiFiCredentials(const String& ssid, const String& pass) {
+void saveWiFiCredentials() {
   preferences.begin("wifi", false);
-  preferences.putString("ssid", ssid);
-  preferences.putString("pass", pass);
+  preferences.putString("ssid", wifi_ssid);
+  preferences.putString("pass", wifi_pass);
+  preferences.putString("identity", wifi_identity);
+  preferences.putString("username", wifi_username);
   preferences.end();
   Serial.println("[NVS] WiFi credentials saved");
+}
+
+void beginWiFiConnect() {
+  WiFi.mode(WIFI_STA);
+  if (wifi_identity.isEmpty() && wifi_username.isEmpty()) {
+    // Without this, a PSK network cannot follow an enterprise one.
+    esp_wifi_sta_wpa2_ent_disable();
+    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+    return;
+  }
+  const String& identity = wifi_identity.isEmpty() ? wifi_username : wifi_identity;
+  esp_wifi_sta_wpa2_ent_set_identity((const unsigned char*)identity.c_str(), identity.length());
+  if (!wifi_username.isEmpty()) {
+    esp_wifi_sta_wpa2_ent_set_username((const unsigned char*)wifi_username.c_str(), wifi_username.length());
+  }
+  esp_wifi_sta_wpa2_ent_set_password((const unsigned char*)wifi_pass.c_str(), wifi_pass.length());
+  esp_wifi_sta_wpa2_ent_enable();
+  WiFi.begin(wifi_ssid.c_str());
+}
+
+void connectAndReport() {
+  Serial.println("{\"status\":\"connecting\"}");
+  avatar.setSpeechText("WiFi接続中...");
+  beginWiFiConnect();
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry < 20) {
+    delay(500);
+    retry++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    wifi_connected = true;
+    WiFi.setSleep(false);  // Disable WiFi power saving for lower latency
+    saveWiFiCredentials();
+    server.begin();
+    Serial.printf("{\"status\":\"ok\",\"ip\":\"%s\"}\n", WiFi.localIP().toString().c_str());
+    avatar.setSpeechText(WiFi.localIP().toString().c_str());
+    delay(2000);
+    avatar.setSpeechText("");
+  } else {
+    Serial.println("{\"status\":\"error\",\"error\":\"wifi connection failed\"}");
+    avatar.setSpeechText("WiFi失敗");
+    delay(1000);
+    avatar.setSpeechText("");
+  }
 }
 
 void clearWiFiCredentials() {
@@ -892,6 +954,8 @@ void clearWiFiCredentials() {
   preferences.end();
   wifi_ssid = "";
   wifi_pass = "";
+  wifi_identity = "";
+  wifi_username = "";
   Serial.println("[NVS] WiFi credentials cleared");
 }
 
@@ -900,10 +964,17 @@ void setupWiFi() {
   preferences.begin("wifi", true);  // read-only
   wifi_ssid = preferences.getString("ssid", "");
   wifi_pass = preferences.getString("pass", "");
+  wifi_identity = preferences.getString("identity", "");
+  wifi_username = preferences.getString("username", "");
   preferences.end();
 
+  // The password is reported as present/absent rather than assumed: a stored
+  // ssid with no password still reaches WiFi.begin() and fails on any secured
+  // network, and "credentials loaded" alone hides that.
   if (!wifi_ssid.isEmpty()) {
-    Serial.println("[NVS] WiFi credentials loaded");
+    Serial.printf("[NVS] WiFi credentials loaded: ssid=\"%s\" password=%s auth=%s\n",
+                  wifi_ssid.c_str(), wifi_pass.isEmpty() ? "MISSING" : "set",
+                  (wifi_identity.isEmpty() && wifi_username.isEmpty()) ? "psk" : "eap");
   }
 
   if (wifi_ssid.isEmpty()) {
@@ -913,8 +984,7 @@ void setupWiFi() {
     avatar.setSpeechText("");
     return;
   } else {
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+    beginWiFiConnect();
   }
 
   // Wait for connection
