@@ -29,6 +29,133 @@ bool setupCamera();
 void handleCapture();
 #endif
 
+// Servo support (M5 official StackChan body: Feetech SCS bus)
+#if defined(ENABLE_SERVO)
+#include <SCSCL.h>
+
+// Wiring and calibration follow the M5Stack StackChan firmware
+// (firmware/main/hal/hal_servo.cpp). One step is 0.3125 deg.
+static constexpr int SERVO_TX_PIN = 6;
+static constexpr int SERVO_RX_PIN = 7;
+static constexpr uint32_t SERVO_BAUD = 1000000;
+static constexpr uint8_t SERVO_ID_YAW = 1;
+static constexpr uint8_t SERVO_ID_PITCH = 2;
+static constexpr int SERVO_ZERO_YAW = 460;
+static constexpr int SERVO_ZERO_PITCH = 620;
+// Travel limits are per servo: pitch runs into the body well before the bus
+// limit, so clamping both axes to 0-1000 would drive it into a mechanical stop.
+static constexpr int SERVO_RAW_MIN_YAW = 0;
+static constexpr int SERVO_RAW_MAX_YAW = 1000;
+static constexpr int SERVO_RAW_MIN_PITCH = 30;
+static constexpr int SERVO_RAW_MAX_PITCH = 870;
+static constexpr int SERVO_MOVE_TIME = 20;
+
+// Servo power (VM EN) sits behind the PY32 IO expander on the StackChan base.
+// The SCS bus stays completely silent until it is switched on.
+static constexpr uint8_t IOE_ADDR = 0x6F;
+static constexpr uint8_t IOE_REG_VERSION = 0x02;
+static constexpr uint8_t IOE_REG_MODE = 0x03;
+static constexpr uint8_t IOE_REG_OUTPUT = 0x05;
+static constexpr uint8_t IOE_REG_PULLUP = 0x09;
+static constexpr uint8_t IOE_PIN_VM_EN = 0;
+// The expander is an MCU-based slave; the official firmware clocks it at 100kHz
+// and it returns garbage at 400kHz.
+static constexpr uint32_t IOE_FREQ = 100000;
+
+static SCSCL scs_bus;
+static bool servo_initialized = false;
+static uint16_t servo_move_time = SERVO_MOVE_TIME;
+
+// M5Unified 0.2.7 has no pin table row for the official StackChan board, which
+// M5GFX reports as board id 27, so _setup_pinmap falls through to the
+// board_unknown row and points the internal bus at the AtomS3 pins (38/39).
+// Every device behind the real internal bus - PMIC, touch, RTC and the servo
+// power expander - is unreachable until it is re-pointed.
+static void fixInternalI2C() {
+  if (M5.getBoard() != m5::board_t::board_M5StackChan) return;
+  if (M5.In_I2C.getSDA() == GPIO_NUM_12 && M5.In_I2C.getSCL() == GPIO_NUM_11) return;
+  M5.In_I2C.release();
+  M5.In_I2C.begin(I2C_NUM_1, GPIO_NUM_12, GPIO_NUM_11);
+}
+
+static bool ioeBitOn(uint8_t reg, uint8_t bit) {
+  uint8_t value = 0;
+  if (!M5.In_I2C.readRegister(IOE_ADDR, reg, &value, 1, IOE_FREQ)) return false;
+  value |= (1 << bit);
+  return M5.In_I2C.writeRegister8(IOE_ADDR, reg, value, IOE_FREQ);
+}
+
+// Mirrors the official firmware's sequence in hal_io_expander.cpp:
+// setDirection(0, true) -> setPullMode(0, true) -> setServoPowerEnabled(true).
+static bool enableServoPower() {
+  fixInternalI2C();
+  bool ok = ioeBitOn(IOE_REG_MODE, IOE_PIN_VM_EN);
+  ok &= ioeBitOn(IOE_REG_PULLUP, IOE_PIN_VM_EN);
+  ok &= ioeBitOn(IOE_REG_OUTPUT, IOE_PIN_VM_EN);
+  delay(300);
+  return ok;
+}
+
+static int servoAngleToRaw(float deg, int zero, int raw_min, int raw_max) {
+  return constrain(zero + (int)lroundf(deg * 16.0f / 5.0f), raw_min, raw_max);
+}
+
+static float servoRawToAngle(int raw, int zero) {
+  return (raw - zero) * 5.0f / 16.0f;
+}
+
+// A servo that never answers is treated as absent, so a bare CoreS3 built with
+// ENABLE_SERVO still boots into the face-only behaviour.
+static bool setupServo() {
+  enableServoPower();
+  Serial1.end();
+  Serial1.begin(SERVO_BAUD, SERIAL_8N1, SERVO_RX_PIN, SERVO_TX_PIN);
+  scs_bus.pSerial = &Serial1;
+
+  // Servos need time to boot after the VM rail comes up. Ping is used rather
+  // than a position read because it answers as soon as the bus is up.
+  for (int i = 0; i < 10; i++) {
+    delay(200);
+    if (scs_bus.Ping(SERVO_ID_YAW) != -1 && scs_bus.Ping(SERVO_ID_PITCH) != -1) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Retried on demand: the expander is not reachable during early boot.
+static bool ensureServo() {
+  if (!servo_initialized) servo_initialized = setupServo();
+  return servo_initialized;
+}
+
+static void servoMove(float yaw_deg, float pitch_deg) {
+  scs_bus.WritePos(SERVO_ID_YAW,
+                   servoAngleToRaw(yaw_deg, SERVO_ZERO_YAW, SERVO_RAW_MIN_YAW, SERVO_RAW_MAX_YAW),
+                   servo_move_time, 0);
+  scs_bus.WritePos(SERVO_ID_PITCH,
+                   servoAngleToRaw(pitch_deg, SERVO_ZERO_PITCH, SERVO_RAW_MIN_PITCH, SERVO_RAW_MAX_PITCH),
+                   servo_move_time, 0);
+}
+
+static void servoTorque(bool enabled) {
+  scs_bus.EnableTorque(SERVO_ID_YAW, enabled ? 1 : 0);
+  scs_bus.EnableTorque(SERVO_ID_PITCH, enabled ? 1 : 0);
+}
+
+static String servoStateJson() {
+  int yaw_raw = scs_bus.ReadPos(SERVO_ID_YAW);
+  int pitch_raw = scs_bus.ReadPos(SERVO_ID_PITCH);
+  if (yaw_raw < 0 || pitch_raw < 0) {
+    return String("{\"status\":\"error\",\"error\":\"servo read failed\"}");
+  }
+  char buf[96];
+  snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"yaw\":%.1f,\"pitch\":%.1f}",
+           servoRawToAngle(yaw_raw, SERVO_ZERO_YAW), servoRawToAngle(pitch_raw, SERVO_ZERO_PITCH));
+  return String(buf);
+}
+#endif
+
 // ---- Configuration ----
 // WiFi credentials: set via Serial, NVS, or SD card
 String wifi_ssid = "";
@@ -283,6 +410,20 @@ void handleFace(AsyncWebServerRequest *request) {
   request->send(200, "application/json", json);
 }
 
+#if defined(ENABLE_SERVO)
+void handleServo(AsyncWebServerRequest *request) {
+  if (!servo_initialized) {
+    request->send(503, "application/json", "{\"error\":\"servo not available\"}");
+    return;
+  }
+  if (request->hasParam("yaw") && request->hasParam("pitch")) {
+    servoMove(request->getParam("yaw")->value().toFloat(),
+              request->getParam("pitch")->value().toFloat());
+  }
+  request->send(200, "application/json", servoStateJson());
+}
+#endif
+
 void handleSetting(AsyncWebServerRequest *request) {
   if (request->hasParam("volume")) {
     int vol = request->getParam("volume")->value().toInt();
@@ -373,6 +514,97 @@ void handleSerialCommand(const String& cmd) {
     }
     Serial.printf("{\"status\":\"ok\",\"volume\":%d}\n", M5.Speaker.getChannelVolume(m5spk_virtual_channel));
 
+#if defined(ENABLE_SERVO)
+  } else if (cmd.startsWith("SERVO:")) {
+    String arg = cmd.substring(6);
+    arg.trim();
+    if (arg == "SCAN") {
+      enableServoPower();
+      Serial1.begin(SERVO_BAUD, SERIAL_8N1, SERVO_RX_PIN, SERVO_TX_PIN);
+      scs_bus.pSerial = &Serial1;
+      delay(1000);
+      Serial.print("{\"ping\":[");
+      for (int id = 0; id <= 20; id++) {
+        if (scs_bus.Ping(id) != -1) Serial.printf("%d,", id);
+        delay(20);
+      }
+      Serial.println("]}");
+    } else if (arg == "IOE") {
+      fixInternalI2C();
+      uint8_t uid = 0, ver = 0;
+      bool ok_uid = M5.In_I2C.readRegister(IOE_ADDR, 0x00, &uid, 1, IOE_FREQ);
+      bool ok_ver = M5.In_I2C.readRegister(IOE_ADDR, IOE_REG_VERSION, &ver, 1, IOE_FREQ);
+      Serial.printf("{\"uid_ok\":%s,\"uid\":\"0x%02X\",\"ver_ok\":%s,\"ver\":\"0x%02X\"}\n",
+                    ok_uid ? "true" : "false", uid, ok_ver ? "true" : "false", ver);
+
+    } else if (arg == "I2CSCAN") {
+      // Probed at the expander's own clock: it NACKs at the 400kHz that
+      // M5Unified's built-in scanID uses.
+      const char *names[] = {"in", "ex"};
+      m5::I2C_Class *buses[] = {&M5.In_I2C, &M5.Ex_I2C};
+      for (int b = 0; b < 2; b++) {
+        m5::I2C_Class *bus = buses[b];
+        Serial.printf("{\"bus\":\"%s\",\"port\":%d,\"sda\":%d,\"scl\":%d,\"addr\":[",
+                      names[b], (int)bus->getPort(), bus->getSDA(), bus->getSCL());
+        for (int addr = 0x08; addr < 0x78; addr++) {
+          bool ack = bus->start(addr, false, IOE_FREQ) && bus->stop();
+          if (!ack) bus->release();
+          if (ack) Serial.printf("\"0x%02X\",", addr);
+          delay(2);
+        }
+        Serial.println("]}");
+      }
+
+    } else if (!ensureServo()) {
+      Serial.println("{\"status\":\"error\",\"error\":\"servo not available\"}");
+    } else if (arg == "?") {
+      Serial.println(servoStateJson());
+    } else if (arg == "PMIC") {
+      // Registers per M5Unified's AXP2101_Class: 0xA4 battery level, 0x01
+      // charge status, 0x34 battery mV, 0x38 VBUS mV (both 14-bit).
+      fixInternalI2C();
+      static constexpr uint8_t AXP_ADDR = 0x34;
+      static constexpr uint32_t AXP_FREQ = 400000;
+      auto r8 = [](uint8_t reg) -> int {
+        uint8_t v = 0;
+        return M5.In_I2C.readRegister(AXP_ADDR, reg, &v, 1, AXP_FREQ) ? v : -1;
+      };
+      auto r14 = [](uint8_t reg) -> int {
+        uint8_t buf[2] = {0};
+        if (!M5.In_I2C.readRegister(AXP_ADDR, reg, buf, 2, AXP_FREQ)) return -1;
+        return ((buf[0] & 0x3F) << 8) | buf[1];
+      };
+      Serial.printf("{\"st0\":%d,\"st1\":%d,\"batt_pct\":%d,\"vbat_mv\":%d,\"vbus_mv\":%d,\"reg16\":%d}\n",
+                    r8(0x00), r8(0x01), r8(0xA4), r14(0x34), r14(0x38), r8(0x16));
+
+    } else if (arg.startsWith("TIME ")) {
+      servo_move_time = (uint16_t)arg.substring(5).toInt();
+      Serial.printf("{\"status\":\"ok\",\"move_time\":%u}\n", servo_move_time);
+
+    } else if (arg == "DIAG") {
+      for (uint8_t id : {SERVO_ID_YAW, SERVO_ID_PITCH}) {
+        Serial.printf("{\"id\":%u,\"volt_dv\":%d,\"current\":%d,\"load\":%d,\"temp_c\":%d,\"moving\":%d}\n",
+                      id, scs_bus.ReadVoltage(id), scs_bus.ReadCurrent(id),
+                      scs_bus.ReadLoad(id), scs_bus.ReadTemper(id), scs_bus.ReadMove(id));
+      }
+
+    } else if (arg == "ON" || arg == "OFF") {
+      bool on = (arg == "ON");
+      servoTorque(on);
+      Serial.printf("{\"status\":\"ok\",\"torque\":%s}\n", on ? "true" : "false");
+    } else {
+      int comma = arg.indexOf(',');
+      if (comma < 0) {
+        Serial.println("{\"status\":\"error\",\"error\":\"expected SERVO:yaw,pitch\"}");
+      } else {
+        float yaw = arg.substring(0, comma).toFloat();
+        float pitch = arg.substring(comma + 1).toFloat();
+        servoMove(yaw, pitch);
+        Serial.printf("{\"status\":\"ok\",\"yaw\":%.1f,\"pitch\":%.1f}\n", yaw, pitch);
+      }
+    }
+
+#endif
   } else if (cmd == "STATUS") {
 #ifdef ARDUINO_M5STACK_ATOMS3R
 #if defined(ENABLE_CAMERA)
@@ -745,6 +977,9 @@ void setup() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/face", HTTP_GET, handleFace);
+#if defined(ENABLE_SERVO)
+  server.on("/servo", HTTP_GET, handleServo);
+#endif
   server.on("/setting", HTTP_GET, handleSetting);
 #if defined(ENABLE_CAMERA)
   server.on("/capture", HTTP_GET, handleCaptureHTTP);
@@ -796,6 +1031,12 @@ void setup() {
     server.begin();
     Serial.println("HTTP server started on port 80");
   }
+
+  // Servo first: the camera driver takes over the shared I2C pins, which leaves
+  // the IO expander (servo power) unreachable if it is initialised afterwards.
+#if defined(ENABLE_SERVO)
+  servo_initialized = setupServo();
+#endif
 
   // Camera init (CoreS3 only)
 #if defined(ENABLE_CAMERA)
