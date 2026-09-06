@@ -49,6 +49,10 @@ static constexpr int SERVO_RAW_MAX_YAW = 1000;
 static constexpr int SERVO_RAW_MIN_PITCH = 30;
 static constexpr int SERVO_RAW_MAX_PITCH = 870;
 static constexpr int SERVO_MOVE_TIME = 20;
+// These servos hold their position by default and keep drawing current while
+// stationary, so torque is dropped once a move has settled. The robot only
+// nods occasionally, so there is nothing to hold between gestures.
+static constexpr uint32_t SERVO_SETTLE_MS = 800;
 
 // Servo power (VM EN) sits behind the PY32 IO expander on the StackChan base.
 // The SCS bus stays completely silent until it is switched on.
@@ -129,18 +133,31 @@ static bool ensureServo() {
   return servo_initialized;
 }
 
+static void servoTorque(bool enabled) {
+  scs_bus.EnableTorque(SERVO_ID_YAW, enabled ? 1 : 0);
+  scs_bus.EnableTorque(SERVO_ID_PITCH, enabled ? 1 : 0);
+}
+
+// 0 = nothing scheduled. Compared with a signed difference so millis() rollover
+// does not postpone a release by 49 days.
+static uint32_t servo_release_at = 0;
+
 static void servoMove(float yaw_deg, float pitch_deg) {
+  servoTorque(true);
   scs_bus.WritePos(SERVO_ID_YAW,
                    servoAngleToRaw(yaw_deg, SERVO_ZERO_YAW, SERVO_RAW_MIN_YAW, SERVO_RAW_MAX_YAW),
                    servo_move_time, 0);
   scs_bus.WritePos(SERVO_ID_PITCH,
                    servoAngleToRaw(pitch_deg, SERVO_ZERO_PITCH, SERVO_RAW_MIN_PITCH, SERVO_RAW_MAX_PITCH),
                    servo_move_time, 0);
+  servo_release_at = millis() + servo_move_time + SERVO_SETTLE_MS;
 }
 
-static void servoTorque(bool enabled) {
-  scs_bus.EnableTorque(SERVO_ID_YAW, enabled ? 1 : 0);
-  scs_bus.EnableTorque(SERVO_ID_PITCH, enabled ? 1 : 0);
+// Called from loop(); cheap enough to run every iteration.
+static void servoReleaseTick() {
+  if (servo_release_at == 0 || (int32_t)(millis() - servo_release_at) < 0) return;
+  servo_release_at = 0;
+  servoTorque(false);
 }
 
 static String servoStateJson() {
@@ -574,8 +591,22 @@ void handleSerialCommand(const String& cmd) {
         if (!M5.In_I2C.readRegister(AXP_ADDR, reg, buf, 2, AXP_FREQ)) return -1;
         return ((buf[0] & 0x3F) << 8) | buf[1];
       };
-      Serial.printf("{\"st0\":%d,\"st1\":%d,\"batt_pct\":%d,\"vbat_mv\":%d,\"vbus_mv\":%d,\"reg16\":%d}\n",
-                    r8(0x00), r8(0x01), r8(0xA4), r14(0x34), r14(0x38), r8(0x16));
+      Serial.printf("{\"chip\":%d,\"st0\":%d,\"st1\":%d,\"batt_pct\":%d,\"vbat_mv\":%d,\"vbus_mv\":%d,\"reg14\":%d,\"vindpm\":%d,\"iin_lim\":%d,\"reg18\":%d,\"chg_cur\":%d}\n",
+                    r8(0x03), r8(0x00), r8(0x01), r8(0xA4), r14(0x34), r14(0x38),
+                    r8(0x14), r8(0x15), r8(0x16), r8(0x18), r8(0x62));
+
+    } else if (arg.startsWith("CHARGE ")) {
+      // Uses M5Unified's own AXP2101 setter rather than a hand-written register
+      // write, so the current encoding stays in one place.
+      fixInternalI2C();
+      m5::AXP2101_Class axp;
+      if (!axp.begin()) {
+        Serial.println("{\"status\":\"error\",\"error\":\"axp2101 not found\"}");
+      } else {
+        uint16_t mA = (uint16_t)arg.substring(7).toInt();
+        axp.setChargeCurrent(mA);
+        Serial.printf("{\"status\":\"ok\",\"requested_ma\":%u}\n", mA);
+      }
 
     } else if (arg.startsWith("TIME ")) {
       servo_move_time = (uint16_t)arg.substring(5).toInt();
@@ -583,13 +614,15 @@ void handleSerialCommand(const String& cmd) {
 
     } else if (arg == "DIAG") {
       for (uint8_t id : {SERVO_ID_YAW, SERVO_ID_PITCH}) {
-        Serial.printf("{\"id\":%u,\"volt_dv\":%d,\"current\":%d,\"load\":%d,\"temp_c\":%d,\"moving\":%d}\n",
-                      id, scs_bus.ReadVoltage(id), scs_bus.ReadCurrent(id),
+        Serial.printf("{\"id\":%u,\"torque\":%d,\"volt_dv\":%d,\"current\":%d,\"load\":%d,\"temp_c\":%d,\"moving\":%d}\n",
+                      id, scs_bus.readByte(id, SCSCL_TORQUE_ENABLE),
+                      scs_bus.ReadVoltage(id), scs_bus.ReadCurrent(id),
                       scs_bus.ReadLoad(id), scs_bus.ReadTemper(id), scs_bus.ReadMove(id));
       }
 
     } else if (arg == "ON" || arg == "OFF") {
       bool on = (arg == "ON");
+      servo_release_at = 0;
       servoTorque(on);
       Serial.printf("{\"status\":\"ok\",\"torque\":%s}\n", on ? "true" : "false");
     } else {
@@ -1068,6 +1101,10 @@ void loop() {
       serial_cmd_buf += c;
     }
   }
+
+#if defined(ENABLE_SERVO)
+  if (servo_initialized) servoReleaseTick();
+#endif
 
   delay(1);
 }
