@@ -30,6 +30,18 @@ bool setupCamera();
 void handleCapture();
 #endif
 
+// M5Unified 0.2.7 has no pin table row for the official StackChan board, which
+// M5GFX reports as board id 27, so _setup_pinmap falls through to the
+// board_unknown row and points the internal bus at the AtomS3 pins (38/39).
+// Every device behind the real internal bus - PMIC, touch, RTC and the servo
+// power expander - is unreachable until it is re-pointed.
+static void fixInternalI2C() {
+  if (M5.getBoard() != m5::board_t::board_M5StackChan) return;
+  if (M5.In_I2C.getSDA() == GPIO_NUM_12 && M5.In_I2C.getSCL() == GPIO_NUM_11) return;
+  M5.In_I2C.release();
+  M5.In_I2C.begin(I2C_NUM_1, GPIO_NUM_12, GPIO_NUM_11);
+}
+
 // Servo support (M5 official StackChan body: Feetech SCS bus)
 #if defined(ENABLE_SERVO)
 #include <SCSCL.h>
@@ -70,18 +82,6 @@ static constexpr uint32_t IOE_FREQ = 100000;
 static SCSCL scs_bus;
 static bool servo_initialized = false;
 static uint16_t servo_move_time = SERVO_MOVE_TIME;
-
-// M5Unified 0.2.7 has no pin table row for the official StackChan board, which
-// M5GFX reports as board id 27, so _setup_pinmap falls through to the
-// board_unknown row and points the internal bus at the AtomS3 pins (38/39).
-// Every device behind the real internal bus - PMIC, touch, RTC and the servo
-// power expander - is unreachable until it is re-pointed.
-static void fixInternalI2C() {
-  if (M5.getBoard() != m5::board_t::board_M5StackChan) return;
-  if (M5.In_I2C.getSDA() == GPIO_NUM_12 && M5.In_I2C.getSCL() == GPIO_NUM_11) return;
-  M5.In_I2C.release();
-  M5.In_I2C.begin(I2C_NUM_1, GPIO_NUM_12, GPIO_NUM_11);
-}
 
 static bool ioeBitOn(uint8_t reg, uint8_t bit) {
   uint8_t value = 0;
@@ -1035,6 +1035,9 @@ void setup() {
   cfg.external_spk = true;
 #endif
   M5.begin(cfg);
+  // The backlight is driven through the PMIC, so re-apply it once the bus is fixed.
+  fixInternalI2C();
+  M5.Display.setBrightness(M5.Display.getBrightness());
 
   // Re-init Serial after M5.begin() for USB CDC on ESP32-S3
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
