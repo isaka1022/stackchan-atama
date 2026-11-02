@@ -299,6 +299,191 @@ volatile bool wav_playing = false;
 // Serial command buffer
 String serial_cmd_buf = "";
 
+// ---- Side panel ----
+static constexpr int PANEL_W = 96;
+static constexpr int FACE_W_PANEL = 224;
+static constexpr int FACE_DX = -48;
+static constexpr int PANEL_ART_Y = 8;
+static constexpr int PANEL_ART_SIZE = 96;
+static constexpr int PANEL_TEXT_Y = 112;
+static constexpr int PANEL_LINE_H = 16;
+static constexpr int PANEL_TEXT_W = PANEL_W - 4;
+static constexpr int PANEL_MAX_LINES = 4;
+static constexpr int PANEL_ROWS_PER_LINE = 2;
+static constexpr size_t PANEL_IMG_MAX = 65536;
+static const char PANEL_ELLIPSIS[] = "\xE2\x80\xA6";  // U+2026, present in efontJA_12
+
+M5Canvas panel_canvas(&M5.Display);
+SemaphoreHandle_t panel_mutex = nullptr;
+volatile bool panel_dirty = false;
+bool panel_on = false;
+bool panel_supported = false;
+
+// Runs inside the avatar draw task, which owns the display bus; pushing from
+// loop() could land between Face::draw's startWrite/endWrite.
+static void panelBlitIfDirty() {
+  if (!panel_dirty) return;
+  if (xSemaphoreTake(panel_mutex, 0) != pdTRUE) return;
+  M5.Display.clearClipRect();
+  M5.Display.startWrite();
+  panel_canvas.pushSprite(&M5.Display, FACE_W_PANEL, 0);
+  M5.Display.endWrite();
+  panel_dirty = false;
+  xSemaphoreGive(panel_mutex);
+}
+
+// Wraps the stock mouth so the panel work happens in the draw task, before
+// Face::draw pushes its strips. The clip rect keeps the shifted 320px-wide
+// face from painting over the panel.
+class PanelHook : public Drawable {
+public:
+  explicit PanelHook(Drawable* inner) : _inner(inner) {}
+  ~PanelHook() override { delete _inner; }
+
+  void draw(M5Canvas* spi, BoundingRect rect, DrawContext* ctx) override {
+    _inner->draw(spi, rect, ctx);
+    if (panel_on) {
+      panelBlitIfDirty();
+      M5.Display.setClipRect(0, 0, FACE_W_PANEL, M5.Display.height());
+    } else {
+      M5.Display.clearClipRect();
+    }
+  }
+
+private:
+  Drawable* _inner;
+};
+
+static void panelInit() {
+  if (M5.Display.width() != 320 || M5.Display.height() != 240) return;
+  panel_canvas.setPsram(true);
+  panel_canvas.setColorDepth(16);
+  if (!panel_canvas.createSprite(PANEL_W, 240)) return;
+  panel_mutex = xSemaphoreCreateMutex();
+  if (!panel_mutex) {
+    panel_canvas.deleteSprite();
+    return;
+  }
+  panel_canvas.fillSprite(TFT_BLACK);
+  Face* face = avatar.getFace();
+  face->setMouth(new PanelHook(face->getMouth()));
+  panel_supported = true;
+}
+
+static void panelSetOn(bool on) {
+  if (on == panel_on) return;
+  if (on) {
+    avatar.setPosition(0, FACE_DX);
+    panel_dirty = true;
+    panel_on = true;
+  } else {
+    panel_on = false;
+    avatar.setPosition(0, 0);
+  }
+}
+
+// len == 0 clears the art box.
+static bool panelSetImage(const uint8_t* buf, size_t len) {
+  xSemaphoreTake(panel_mutex, portMAX_DELAY);
+  panel_canvas.fillRect(0, PANEL_ART_Y, PANEL_W, PANEL_ART_SIZE, TFT_BLACK);
+  bool ok = (len == 0) || panel_canvas.drawJpg(buf, len, 0, PANEL_ART_Y, PANEL_W, PANEL_ART_SIZE);
+  panel_dirty = true;
+  xSemaphoreGive(panel_mutex);
+  return ok;
+}
+
+static size_t utf8CharLen(uint8_t c) {
+  if ((c & 0xE0) == 0xC0) return 2;
+  if ((c & 0xF0) == 0xE0) return 3;
+  if ((c & 0xF8) == 0xF0) return 4;
+  return 1;
+}
+
+// Wraps one line by code point into at most PANEL_ROWS_PER_LINE rows and
+// returns the number of rows used.
+static int panelDrawWrapped(const String& line, int y) {
+  String row;
+  int rows = 0;
+  size_t i = 0;
+  while (i < line.length()) {
+    size_t n = utf8CharLen(line[i]);
+    String next = row + line.substring(i, i + n);
+    if (panel_canvas.textWidth(next.c_str()) > PANEL_TEXT_W && row.length() > 0) {
+      if (rows == PANEL_ROWS_PER_LINE - 1) break;
+      panel_canvas.drawString(row.c_str(), 2, y + rows * PANEL_LINE_H);
+      rows++;
+      row = "";
+      continue;
+    }
+    row = next;
+    i += n;
+  }
+  if (i < line.length()) {
+    while (row.length() > 0 && panel_canvas.textWidth((row + PANEL_ELLIPSIS).c_str()) > PANEL_TEXT_W) {
+      size_t cut = row.length() - 1;
+      while (cut > 0 && ((uint8_t)row[cut] & 0xC0) == 0x80) cut--;
+      row.remove(cut);
+    }
+    row += PANEL_ELLIPSIS;
+  }
+  if (row.length() > 0) {
+    panel_canvas.drawString(row.c_str(), 2, y + rows * PANEL_LINE_H);
+    rows++;
+  }
+  return rows > 0 ? rows : 1;
+}
+
+// Lines are separated by '|'; an empty string clears the text area.
+static int panelSetText(const String& text) {
+  String lines[PANEL_MAX_LINES];
+  int count = 0;
+  int start = 0;
+  while (text.length() > 0 && count < PANEL_MAX_LINES) {
+    int bar = text.indexOf('|', start);
+    if (bar < 0) {
+      lines[count++] = text.substring(start);
+      break;
+    }
+    lines[count++] = text.substring(start, bar);
+    start = bar + 1;
+  }
+
+  xSemaphoreTake(panel_mutex, portMAX_DELAY);
+  panel_canvas.fillRect(0, PANEL_TEXT_Y, PANEL_W, panel_canvas.height() - PANEL_TEXT_Y, TFT_BLACK);
+  panel_canvas.setFont(&fonts::efontJA_12);
+  panel_canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+  panel_canvas.setTextDatum(textdatum_t::top_left);
+  int y = PANEL_TEXT_Y;
+  for (int i = 0; i < count; i++) {
+    y += panelDrawWrapped(lines[i], y) * PANEL_LINE_H;
+  }
+  panel_dirty = true;
+  xSemaphoreGive(panel_mutex);
+  return count;
+}
+
+// ---- Touch ----
+static constexpr uint32_t TOUCH_DEBOUNCE_MS = 250;
+static uint32_t touch_last_ms = 0;
+
+static void touchTick() {
+  if (!M5.Touch.isEnabled() || M5.Touch.getCount() != 1) return;
+  const auto& t = M5.Touch.getDetail(0);
+  if (!t.wasClicked()) return;
+  uint32_t now = millis();
+  if (now - touch_last_ms < TOUCH_DEBOUNCE_MS) return;
+  touch_last_ms = now;
+
+  int face_w = panel_on ? FACE_W_PANEL : M5.Display.width();
+  const char* zone;
+  if (t.x >= face_w) zone = "panel";
+  else if (t.x < face_w / 3) zone = "left";
+  else if (t.x < face_w * 2 / 3) zone = "center";
+  else zone = "right";
+  Serial.printf("{\"event\":\"touch\",\"zone\":\"%s\",\"x\":%d,\"y\":%d}\n", zone, t.x, t.y);
+  Serial.flush();
+}
+
 // ---- Expression map ----
 Expression getExpression(const String& name) {
   if (name == "happy" || name == "1") return Expression::Happy;
@@ -463,8 +648,69 @@ void handleSetting(AsyncWebServerRequest *request) {
   request->send(200, "application/json", json);
 }
 
+void handleText(AsyncWebServerRequest *request) {
+  if (!panel_supported) {
+    request->send(503, "application/json", "{\"error\":\"panel not supported\"}");
+    return;
+  }
+  if (!request->hasParam("lines")) {
+    request->send(400, "application/json", "{\"error\":\"lines parameter required\"}");
+    return;
+  }
+
+  JsonDocument doc;
+  doc["status"] = "ok";
+  doc["lines"] = panelSetText(request->getParam("lines")->value());
+  String json;
+  serializeJson(doc, json);
+  request->send(200, "application/json", json);
+}
+
+void handlePanel(AsyncWebServerRequest *request) {
+  if (!panel_supported) {
+    request->send(503, "application/json", "{\"error\":\"panel not supported\"}");
+    return;
+  }
+  if (request->hasParam("on")) {
+    panelSetOn(request->getParam("on")->value() == "1");
+  }
+
+  JsonDocument doc;
+  doc["status"] = "ok";
+  doc["panel"] = panel_on;
+  String json;
+  serializeJson(doc, json);
+  request->send(200, "application/json", json);
+}
+
 void handleNotFound(AsyncWebServerRequest *request) {
   request->send(404, "application/json", "{\"error\":\"not found\"}");
+}
+
+// Reads a binary payload after the READY handshake. Returns the bytes received,
+// which is short of len if the line stays idle for 30 s.
+static size_t readSerialPayload(uint8_t* buf, size_t len) {
+  // Drain any leftover data in serial buffer before signaling READY
+  while (Serial.available()) Serial.read();
+
+  Serial.println("READY");  // Signal PC to start sending binary
+  Serial.flush();  // Ensure READY is sent before reading
+
+  size_t received = 0;
+  unsigned long start = millis();
+  while (received < len && (millis() - start) < 30000) {
+    int avail = Serial.available();
+    if (avail > 0) {
+      while (avail > 0 && received < len) {
+        buf[received++] = Serial.read();
+        avail--;
+      }
+      start = millis();
+    } else {
+      delay(1);
+    }
+  }
+  return received;
 }
 
 // ---- Serial Command Handler ----
@@ -472,6 +718,10 @@ void handleNotFound(AsyncWebServerRequest *request) {
 //   FACE:happy       - Change expression
 //   WAV:12345        - Receive WAV binary (next 12345 bytes)
 //   VOLUME:180       - Set volume (0-255)
+//   IMG:12345        - Receive JPEG for the side panel art box (IMG:0 clears)
+//   TEXT:a|b         - Set side panel text (up to 4 lines, empty clears)
+//   PANEL:ON|OFF|?   - Show/hide the side panel
+//   TOUCH:?          - Print touch controller state
 //   STATUS           - Print status JSON
 //   WIFI:ssid:pass   - Connect to WiFi
 void handleSerialCommand(const String& cmd) {
@@ -501,27 +751,7 @@ void handleSerialCommand(const String& cmd) {
       return;
     }
 
-    // Drain any leftover data in serial buffer before signaling READY
-    while (Serial.available()) Serial.read();
-
-    Serial.println("READY");  // Signal PC to start sending binary
-    Serial.flush();  // Ensure READY is sent before reading
-
-    // Read binary data from serial
-    size_t received = 0;
-    unsigned long start = millis();
-    while (received < len && (millis() - start) < 30000) {
-      int avail = Serial.available();
-      if (avail > 0) {
-        while (avail > 0 && received < len) {
-          buf[received++] = Serial.read();
-          avail--;
-        }
-        start = millis();
-      } else {
-        delay(1);
-      }
-    }
+    size_t received = readSerialPayload(buf, len);
     if (received == len) {
       wavQueuePush(buf, len);
       Serial.printf("{\"status\":\"ok\",\"size\":%d,\"queued\":%d}\n", len, wavQueueCount());
@@ -536,6 +766,79 @@ void handleSerialCommand(const String& cmd) {
       M5.Speaker.setChannelVolume(m5spk_virtual_channel, vol);
     }
     Serial.printf("{\"status\":\"ok\",\"volume\":%d}\n", M5.Speaker.getChannelVolume(m5spk_virtual_channel));
+
+  } else if (cmd.startsWith("IMG:")) {
+    if (!panel_supported) {
+      Serial.println("{\"status\":\"error\",\"error\":\"panel not supported\"}");
+      return;
+    }
+    size_t len = cmd.substring(4).toInt();
+    if (len == 0) {
+      panelSetImage(nullptr, 0);
+      Serial.println("{\"status\":\"ok\",\"size\":0}");
+      return;
+    }
+    if (len < 4 || len > PANEL_IMG_MAX) {
+      Serial.println("{\"status\":\"error\",\"error\":\"invalid size\"}");
+      return;
+    }
+    uint8_t* buf = (uint8_t*)(psramFound() ? ps_malloc(len) : malloc(len));
+    if (buf == nullptr) {
+      Serial.println("{\"status\":\"error\",\"error\":\"memory allocation failed\"}");
+      return;
+    }
+    size_t received = readSerialPayload(buf, len);
+    if (received != len) {
+      Serial.printf("{\"status\":\"error\",\"error\":\"incomplete\",\"received\":%d,\"expected\":%d}\n", received, len);
+    } else if (buf[0] != 0xFF || buf[1] != 0xD8 || !panelSetImage(buf, len)) {
+      Serial.println("{\"status\":\"error\",\"error\":\"decode failed\"}");
+    } else {
+      Serial.printf("{\"status\":\"ok\",\"size\":%d}\n", len);
+    }
+    free(buf);
+
+  } else if (cmd.startsWith("TEXT:")) {
+    if (!panel_supported) {
+      Serial.println("{\"status\":\"error\",\"error\":\"panel not supported\"}");
+      return;
+    }
+    Serial.printf("{\"status\":\"ok\",\"lines\":%d}\n", panelSetText(cmd.substring(5)));
+
+  } else if (cmd.startsWith("PANEL:")) {
+    String arg = cmd.substring(6);
+    arg.trim();
+    if (!panel_supported) {
+      Serial.println("{\"status\":\"error\",\"error\":\"panel not supported\"}");
+    } else if (arg == "ON" || arg == "OFF" || arg == "?") {
+      if (arg != "?") panelSetOn(arg == "ON");
+      Serial.printf("{\"status\":\"ok\",\"panel\":%s}\n", panel_on ? "true" : "false");
+    } else {
+      Serial.println("{\"status\":\"error\",\"error\":\"expected PANEL:ON|OFF|?\"}");
+    }
+
+  } else if (cmd.startsWith("I2C:")) {
+    // I2C:<addr>:<reg>[:<count>] (hex) reads registers on the internal bus.
+    unsigned addr = 0, reg = 0, n = 1;
+    int parsed = sscanf(cmd.c_str() + 4, "%x:%x:%u", &addr, &reg, &n);
+    uint8_t buf[16];
+    if (parsed < 2 || n < 1 || n > sizeof(buf)) {
+      Serial.println("{\"status\":\"error\",\"error\":\"expected I2C:<addr>:<reg>[:<count>]\"}");
+    } else if (!M5.In_I2C.readRegister(addr, reg, buf, n, 400000)) {
+      Serial.println("{\"status\":\"error\",\"error\":\"nack\"}");
+    } else {
+      Serial.print("{\"status\":\"ok\",\"data\":[");
+      for (unsigned i = 0; i < n; i++) Serial.printf("%s%u", i ? "," : "", buf[i]);
+      Serial.println("]}");
+    }
+
+  } else if (cmd.startsWith("BRIGHT:")) {
+    int level = cmd.substring(7).toInt();
+    M5.Display.setBrightness(constrain(level, 0, 255));
+    Serial.printf("{\"status\":\"ok\",\"brightness\":%d}\n", M5.Display.getBrightness());
+
+  } else if (cmd == "TOUCH:?") {
+    Serial.printf("{\"status\":\"ok\",\"touch\":%s,\"count\":%d}\n",
+                  M5.Touch.isEnabled() ? "true" : "false", M5.Touch.getCount());
 
 #if defined(ENABLE_SERVO)
   } else if (cmd.startsWith("SERVO:")) {
@@ -1080,6 +1383,7 @@ void setup() {
 #else
   // M5Stack devices: Use default initialization with display
   avatar.init();
+  panelInit();
 #endif
   avatar.setExpression(Expression::Neutral);
 
@@ -1145,6 +1449,52 @@ void setup() {
     }
   );
 
+  // img: POST a JPEG for the side panel art box
+  // Usage: curl -X POST -H "Content-Type: application/octet-stream" --data-binary @art.jpg http://<ip>/img
+  server.on("/img", HTTP_POST,
+    [](AsyncWebServerRequest *request) {
+      uint8_t* buf = (uint8_t*)request->_tempObject;
+      request->_tempObject = nullptr;
+      if (!panel_supported) {
+        free(buf);
+        request->send(503, "application/json", "{\"error\":\"panel not supported\"}");
+        return;
+      }
+      if (!buf) {
+        request->send(400, "application/json", "{\"error\":\"no data received\"}");
+        return;
+      }
+      size_t len = request->contentLength();
+      bool ok = buf[0] == 0xFF && buf[1] == 0xD8 && panelSetImage(buf, len);
+      free(buf);
+      if (!ok) {
+        request->send(400, "application/json", "{\"error\":\"decode failed\"}");
+        return;
+      }
+      JsonDocument doc;
+      doc["status"] = "ok";
+      doc["size"] = len;
+      String json;
+      serializeJson(doc, json);
+      request->send(200, "application/json", json);
+    },
+    NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      if (index == 0) {
+        if (total < 4 || total > PANEL_IMG_MAX) return;
+        uint8_t* buf = (uint8_t*)(psramFound() ? ps_malloc(total) : malloc(total));
+        if (!buf) return;
+        request->_tempObject = buf;
+      }
+      uint8_t* buf = (uint8_t*)request->_tempObject;
+      if (buf) {
+        memcpy(buf + index, data, len);
+      }
+    }
+  );
+  server.on("/text", HTTP_GET, handleText);
+  server.on("/panel", HTTP_GET, handlePanel);
+
   server.onNotFound(handleNotFound);
   if (wifi_connected) {
     server.begin();
@@ -1163,15 +1513,16 @@ void setup() {
 #endif
 
 #ifdef ARDUINO_M5STACK_ATOMS3R
-  Serial.println("[AtomS3R+Echo] Serial commands ready: FACE:expr WAV:size VOLUME:vol STATUS WIFI:ssid:pass CAPTURE");
+  Serial.println("[AtomS3R+Echo] Serial commands ready: FACE:expr WAV:size VOLUME:vol IMG:size TEXT:a|b PANEL:ON|OFF|? TOUCH:? STATUS WIFI:ssid:pass CAPTURE");
 #else
-  Serial.println("Serial commands ready: FACE:expr WAV:size VOLUME:vol STATUS WIFI:ssid:pass CAPTURE");
+  Serial.println("Serial commands ready: FACE:expr WAV:size VOLUME:vol IMG:size TEXT:a|b PANEL:ON|OFF|? TOUCH:? STATUS WIFI:ssid:pass CAPTURE");
 #endif
 }
 
 // ---- Loop ----
 void loop() {
   M5.update();
+  touchTick();
 
   // Note: ESPAsyncWebServer handles HTTP clients automatically (no handleClient() needed)
 
