@@ -583,6 +583,8 @@ static void touchTick() {
   if (!M5.Touch.isEnabled() || M5.Touch.getCount() != 1) return;
   const auto& t = M5.Touch.getDetail(0);
   if (!t.wasClicked()) return;
+  // The first click after boot or a USB re-enumeration can arrive as (0,0).
+  if (t.x == 0 && t.y == 0) return;
   uint32_t now = millis();
   if (now - touch_last_ms < TOUCH_DEBOUNCE_MS) return;
   touch_last_ms = now;
@@ -595,6 +597,31 @@ static void touchTick() {
   else zone = "right";
   Serial.printf("{\"event\":\"touch\",\"zone\":\"%s\",\"x\":%d,\"y\":%d}\n", zone, t.x, t.y);
   Serial.flush();
+}
+
+// ---- Backlight watchdog ----
+// On the official StackChan the backlight rail (AXP2101 DLDO1) has been seen
+// to switch off while the firmware kept running. Until the cause is known,
+// report the PMIC state when it happens and turn the rail back on.
+static constexpr uint32_t BACKLIGHT_CHECK_MS = 2000;
+static constexpr uint8_t AXP2101_ADDR = 0x34;
+static uint32_t backlight_last_ms = 0;
+
+static void backlightTick() {
+  if (M5.getBoard() != m5::board_t::board_M5StackChan) return;
+  uint32_t now = millis();
+  if (now - backlight_last_ms < BACKLIGHT_CHECK_MS) return;
+  backlight_last_ms = now;
+  uint8_t ldo = 0;
+  if (!M5.In_I2C.readRegister(AXP2101_ADDR, 0x90, &ldo, 1, 400000)) return;
+  if (ldo & 0x80) return;
+  uint8_t st[2] = {0}, irq[3] = {0};
+  M5.In_I2C.readRegister(AXP2101_ADDR, 0x00, st, 2, 400000);
+  M5.In_I2C.readRegister(AXP2101_ADDR, 0x48, irq, 3, 400000);
+  Serial.printf("{\"event\":\"backlight_off\",\"ms\":%lu,\"ldo\":%u,\"status\":[%u,%u],\"irq\":[%u,%u,%u]}\n",
+    (unsigned long)now, ldo, st[0], st[1], irq[0], irq[1], irq[2]);
+  Serial.flush();
+  M5.Display.setBrightness(M5.Display.getBrightness());
 }
 
 // ---- Expression map ----
@@ -1670,6 +1697,7 @@ void setup() {
 void loop() {
   M5.update();
   touchTick();
+  backlightTick();
 
   // Note: ESPAsyncWebServer handles HTTP clients automatically (no handleClient() needed)
 
