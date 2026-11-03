@@ -300,24 +300,50 @@ volatile bool wav_playing = false;
 String serial_cmd_buf = "";
 
 // ---- Side panel ----
-static constexpr int PANEL_W = 96;
-static constexpr int FACE_W_PANEL = 224;
-static constexpr int FACE_DX = -48;
-static constexpr int PANEL_ART_Y = 8;
-static constexpr int PANEL_ART_SIZE = 96;
-static constexpr int PANEL_TEXT_Y = 112;
+static constexpr int PANEL_W_DEFAULT = 96;
+static constexpr int PANEL_W_MIN = 64;
+static constexpr int PANEL_W_MAX = 240;
+static constexpr int PANEL_H = 240;
+static constexpr int PANEL_ART_MAX = 200;
+// y 200..240 is reserved for a button strip the host pushes with IMG.
+static constexpr int PANEL_TEXT_BOTTOM = 200;
 static constexpr int PANEL_LINE_H = 16;
-static constexpr int PANEL_TEXT_W = PANEL_W - 4;
 static constexpr int PANEL_MAX_LINES = 4;
 static constexpr int PANEL_ROWS_PER_LINE = 2;
 static constexpr size_t PANEL_IMG_MAX = 65536;
 static const char PANEL_ELLIPSIS[] = "\xE2\x80\xA6";  // U+2026, present in efontJA_12
+
+struct PanelLayout {
+  int w;
+  int face_w;
+  int art_x;
+  int art_y;
+  int art_size;
+  int text_y;
+  int text_rows;
+};
+
+static PanelLayout panelLayout(int w) {
+  PanelLayout l;
+  l.w = w;
+  l.face_w = 320 - w;
+  l.art_size = std::min(w, PANEL_ART_MAX);
+  l.art_x = (w - l.art_size) / 2;
+  l.art_y = (w >= 160) ? 0 : 8;
+  l.text_y = l.art_y + l.art_size + 8;
+  l.text_rows = std::max(0, (PANEL_TEXT_BOTTOM - l.text_y) / PANEL_LINE_H);
+  return l;
+}
 
 M5Canvas panel_canvas(&M5.Display);
 SemaphoreHandle_t panel_mutex = nullptr;
 volatile bool panel_dirty = false;
 bool panel_on = false;
 bool panel_supported = false;
+PanelLayout panel_layout = panelLayout(PANEL_W_DEFAULT);
+Face* face_full = nullptr;
+Face* face_panel = nullptr;
+M5Canvas* face_panel_strip = nullptr;  // Face's tmpSprite, which ~Face does not free
 
 // Runs inside the avatar draw task, which owns the display bus; pushing from
 // loop() could land between Face::draw's startWrite/endWrite.
@@ -326,15 +352,15 @@ static void panelBlitIfDirty() {
   if (xSemaphoreTake(panel_mutex, 0) != pdTRUE) return;
   M5.Display.clearClipRect();
   M5.Display.startWrite();
-  panel_canvas.pushSprite(&M5.Display, FACE_W_PANEL, 0);
+  panel_canvas.pushSprite(&M5.Display, panel_layout.face_w, 0);
   M5.Display.endWrite();
   panel_dirty = false;
   xSemaphoreGive(panel_mutex);
 }
 
 // Wraps the stock mouth so the panel work happens in the draw task, before
-// Face::draw pushes its strips. The clip rect keeps the shifted 320px-wide
-// face from painting over the panel.
+// Face::draw pushes its strips. The clip rect keeps the face from painting
+// over the panel.
 class PanelHook : public Drawable {
 public:
   explicit PanelHook(Drawable* inner) : _inner(inner) {}
@@ -344,7 +370,7 @@ public:
     _inner->draw(spi, rect, ctx);
     if (panel_on) {
       panelBlitIfDirty();
-      M5.Display.setClipRect(0, 0, FACE_W_PANEL, M5.Display.height());
+      M5.Display.setClipRect(0, 0, panel_layout.face_w, M5.Display.height());
     } else {
       M5.Display.clearClipRect();
     }
@@ -358,38 +384,118 @@ static void panelInit() {
   if (M5.Display.width() != 320 || M5.Display.height() != 240) return;
   panel_canvas.setPsram(true);
   panel_canvas.setColorDepth(16);
-  if (!panel_canvas.createSprite(PANEL_W, 240)) return;
+  if (!panel_canvas.createSprite(panel_layout.w, PANEL_H)) return;
   panel_mutex = xSemaphoreCreateMutex();
   if (!panel_mutex) {
     panel_canvas.deleteSprite();
     return;
   }
   panel_canvas.fillSprite(TFT_BLACK);
-  Face* face = avatar.getFace();
-  face->setMouth(new PanelHook(face->getMouth()));
+  face_full = avatar.getFace();
+  face_full->setMouth(new PanelHook(face_full->getMouth()));
   panel_supported = true;
 }
 
-static void panelSetOn(bool on) {
-  if (on == panel_on) return;
-  if (on) {
-    avatar.setPosition(0, FACE_DX);
-    panel_dirty = true;
-    panel_on = true;
-  } else {
-    panel_on = false;
-    avatar.setPosition(0, 0);
-  }
+static uint16_t scaledSize(int v, float s) {
+  long r = lroundf(v * s);
+  return r < 1 ? 1 : (uint16_t)r;
 }
 
-// len == 0 clears the art box.
-static bool panelSetImage(const uint8_t* buf, size_t len) {
+// The stock layout scaled into a face fw wide. Face's constructor leaves its
+// balloon/effect/battery pointers uninitialised and ~Face deletes them, so the
+// object lives in zeroed memory to make those deletes no-ops.
+static Face* makePanelFace(int fw) {
+  float s = std::min(1.0f, fw / 160.0f);
+  auto pos = [&](int top, int left) {
+    return new BoundingRect((int16_t)lroundf((top - 120) * s + 120),
+                            (int16_t)lroundf((left - 160) * s + fw / 2));
+  };
+  void* mem = calloc(1, sizeof(Face));
+  if (!mem) return nullptr;
+  face_panel_strip = new M5Canvas(&M5.Display);
+  return new (mem) Face(
+      new PanelHook(new Mouth(scaledSize(50, s), scaledSize(90, s), scaledSize(4, s), scaledSize(60, s))),
+      pos(148, 163),
+      new Eye(scaledSize(8, s), false), pos(93, 90),
+      new Eye(scaledSize(8, s), true), pos(96, 230),
+      new Eyeblow(scaledSize(32, s), 0, false), pos(67, 96),
+      new Eyeblow(scaledSize(32, s), 0, true), pos(72, 230),
+      new BoundingRect(0, 0, fw, PANEL_H),
+      new M5Canvas(&M5.Display), face_panel_strip);
+}
+
+// Caller must have taken face_panel off the avatar and let a frame finish.
+static void destroyPanelFace() {
+  if (!face_panel) return;
+  face_panel->~Face();
+  free(face_panel);
+  face_panel = nullptr;
+  delete face_panel_strip;
+  face_panel_strip = nullptr;
+}
+
+// Returns false when the canvas or face for width w cannot be allocated; the
+// panel is then left off.
+static bool panelSetOn(bool on, int w = PANEL_W_DEFAULT) {
+  if (!on) {
+    if (panel_on) {
+      panel_on = false;
+      avatar.setFace(face_full);
+    }
+    return true;
+  }
+  if (panel_on && w == panel_layout.w) return true;
+
+  if (panel_on) {
+    panel_on = false;
+    avatar.setFace(face_full);
+  }
+  if (w != panel_layout.w) {
+    if (face_panel) {
+      delay(60);
+      destroyPanelFace();
+    }
+    xSemaphoreTake(panel_mutex, portMAX_DELAY);
+    panel_canvas.deleteSprite();
+    bool ok = panel_canvas.createSprite(w, PANEL_H) != nullptr;
+    if (!ok) panel_canvas.createSprite(panel_layout.w, PANEL_H);
+    panel_canvas.fillSprite(TFT_BLACK);
+    if (ok) panel_layout = panelLayout(w);
+    xSemaphoreGive(panel_mutex);
+    if (!ok) return false;
+  }
+  if (!face_panel) {
+    face_panel = makePanelFace(panel_layout.face_w);
+    if (!face_panel) return false;
+  }
+  panel_dirty = true;
+  panel_on = true;
+  avatar.setFace(face_panel);
+  return true;
+}
+
+static String panelStateJson() {
+  const PanelLayout& l = panel_layout;
+  char buf[160];
+  snprintf(buf, sizeof(buf),
+           "{\"status\":\"ok\",\"panel\":%s,\"width\":%d,\"art\":[%d,%d,%d],\"text_y\":%d,\"text_rows\":%d}",
+           panel_on ? "true" : "false", l.w, l.art_x, l.art_y, l.art_size, l.text_y, l.text_rows);
+  return String(buf);
+}
+
+// len == 0 clears the box.
+static bool panelSetImage(const uint8_t* buf, size_t len, int x, int y, int w, int h) {
   xSemaphoreTake(panel_mutex, portMAX_DELAY);
-  panel_canvas.fillRect(0, PANEL_ART_Y, PANEL_W, PANEL_ART_SIZE, TFT_BLACK);
-  bool ok = (len == 0) || panel_canvas.drawJpg(buf, len, 0, PANEL_ART_Y, PANEL_W, PANEL_ART_SIZE);
+  panel_canvas.fillRect(x, y, w, h, TFT_BLACK);
+  bool ok = (len == 0) || panel_canvas.drawJpg(buf, len, x, y, w, h);
   panel_dirty = true;
   xSemaphoreGive(panel_mutex);
   return ok;
+}
+
+static bool panelSetArt(const uint8_t* buf, size_t len) {
+  const PanelLayout& l = panel_layout;
+  return panelSetImage(buf, len, l.art_x, l.art_y, l.art_size, l.art_size);
 }
 
 static size_t utf8CharLen(uint8_t c) {
@@ -399,17 +505,17 @@ static size_t utf8CharLen(uint8_t c) {
   return 1;
 }
 
-// Wraps one line by code point into at most PANEL_ROWS_PER_LINE rows and
+// Wraps one line by code point into at most max_rows rows of width text_w and
 // returns the number of rows used.
-static int panelDrawWrapped(const String& line, int y) {
+static int panelDrawWrapped(const String& line, int y, int text_w, int max_rows) {
   String row;
   int rows = 0;
   size_t i = 0;
   while (i < line.length()) {
     size_t n = utf8CharLen(line[i]);
     String next = row + line.substring(i, i + n);
-    if (panel_canvas.textWidth(next.c_str()) > PANEL_TEXT_W && row.length() > 0) {
-      if (rows == PANEL_ROWS_PER_LINE - 1) break;
+    if (panel_canvas.textWidth(next.c_str()) > text_w && row.length() > 0) {
+      if (rows == max_rows - 1) break;
       panel_canvas.drawString(row.c_str(), 2, y + rows * PANEL_LINE_H);
       rows++;
       row = "";
@@ -419,7 +525,7 @@ static int panelDrawWrapped(const String& line, int y) {
     i += n;
   }
   if (i < line.length()) {
-    while (row.length() > 0 && panel_canvas.textWidth((row + PANEL_ELLIPSIS).c_str()) > PANEL_TEXT_W) {
+    while (row.length() > 0 && panel_canvas.textWidth((row + PANEL_ELLIPSIS).c_str()) > text_w) {
       size_t cut = row.length() - 1;
       while (cut > 0 && ((uint8_t)row[cut] & 0xC0) == 0x80) cut--;
       row.remove(cut);
@@ -433,7 +539,8 @@ static int panelDrawWrapped(const String& line, int y) {
   return rows > 0 ? rows : 1;
 }
 
-// Lines are separated by '|'; an empty string clears the text area.
+// Lines are separated by '|'; an empty string clears the text area. At most
+// text_rows rows are drawn, so with 0 rows the text is accepted but not shown.
 static int panelSetText(const String& text) {
   String lines[PANEL_MAX_LINES];
   int count = 0;
@@ -449,13 +556,19 @@ static int panelSetText(const String& text) {
   }
 
   xSemaphoreTake(panel_mutex, portMAX_DELAY);
-  panel_canvas.fillRect(0, PANEL_TEXT_Y, PANEL_W, panel_canvas.height() - PANEL_TEXT_Y, TFT_BLACK);
+  const PanelLayout& l = panel_layout;
+  if (l.text_rows > 0) {
+    panel_canvas.fillRect(0, l.text_y, l.w, l.text_rows * PANEL_LINE_H, TFT_BLACK);
+  }
   panel_canvas.setFont(&fonts::efontJA_12);
   panel_canvas.setTextColor(TFT_WHITE, TFT_BLACK);
   panel_canvas.setTextDatum(textdatum_t::top_left);
-  int y = PANEL_TEXT_Y;
-  for (int i = 0; i < count; i++) {
-    y += panelDrawWrapped(lines[i], y) * PANEL_LINE_H;
+  int y = l.text_y;
+  int rows_left = l.text_rows;
+  for (int i = 0; i < count && rows_left > 0; i++) {
+    int used = panelDrawWrapped(lines[i], y, l.w - 4, std::min(PANEL_ROWS_PER_LINE, rows_left));
+    y += used * PANEL_LINE_H;
+    rows_left -= used;
   }
   panel_dirty = true;
   xSemaphoreGive(panel_mutex);
@@ -474,7 +587,7 @@ static void touchTick() {
   if (now - touch_last_ms < TOUCH_DEBOUNCE_MS) return;
   touch_last_ms = now;
 
-  int face_w = panel_on ? FACE_W_PANEL : M5.Display.width();
+  int face_w = panel_on ? panel_layout.face_w : M5.Display.width();
   const char* zone;
   if (t.x >= face_w) zone = "panel";
   else if (t.x < face_w / 3) zone = "left";
@@ -672,15 +785,21 @@ void handlePanel(AsyncWebServerRequest *request) {
     return;
   }
   if (request->hasParam("on")) {
-    panelSetOn(request->getParam("on")->value() == "1");
+    bool on = request->getParam("on")->value() == "1";
+    int w = PANEL_W_DEFAULT;
+    if (request->hasParam("w")) {
+      w = request->getParam("w")->value().toInt();
+      if (w < PANEL_W_MIN || w > PANEL_W_MAX) {
+        request->send(400, "application/json", "{\"error\":\"w must be 64..240\"}");
+        return;
+      }
+    }
+    if (!panelSetOn(on, w)) {
+      request->send(500, "application/json", "{\"error\":\"panel alloc failed\"}");
+      return;
+    }
   }
-
-  JsonDocument doc;
-  doc["status"] = "ok";
-  doc["panel"] = panel_on;
-  String json;
-  serializeJson(doc, json);
-  request->send(200, "application/json", json);
+  request->send(200, "application/json", panelStateJson());
 }
 
 void handleNotFound(AsyncWebServerRequest *request) {
@@ -718,9 +837,9 @@ static size_t readSerialPayload(uint8_t* buf, size_t len) {
 //   FACE:happy       - Change expression
 //   WAV:12345        - Receive WAV binary (next 12345 bytes)
 //   VOLUME:180       - Set volume (0-255)
-//   IMG:12345        - Receive JPEG for the side panel art box (IMG:0 clears)
+//   IMG:12345[:x:y[:w:h]] - Receive JPEG for a side panel box (default: art box; IMG:0 clears)
 //   TEXT:a|b         - Set side panel text (up to 4 lines, empty clears)
-//   PANEL:ON|OFF|?   - Show/hide the side panel
+//   PANEL:ON[:w]|OFF|? - Show/hide the side panel, w = 64..240 px (default 96)
 //   TOUCH:?          - Print touch controller state
 //   STATUS           - Print status JSON
 //   WIFI:ssid:pass   - Connect to WiFi
@@ -772,9 +891,22 @@ void handleSerialCommand(const String& cmd) {
       Serial.println("{\"status\":\"error\",\"error\":\"panel not supported\"}");
       return;
     }
-    size_t len = cmd.substring(4).toInt();
+    // IMG:<bytes>[:<x>:<y>[:<w>:<h>]] places the JPEG in the given panel box
+    // (default: the art box). The box is cleared first; IMG:0 only clears it.
+    unsigned len = 0;
+    const PanelLayout& l = panel_layout;
+    int x = l.art_x, y = l.art_y, w = l.art_size, h = l.art_size;
+    int n = sscanf(cmd.c_str() + 4, "%u:%d:%d:%d:%d", &len, &x, &y, &w, &h);
+    if (n != 1 && n != 3 && n != 5) {
+      Serial.println("{\"status\":\"error\",\"error\":\"usage: IMG:<bytes>[:<x>:<y>[:<w>:<h>]]\"}");
+      return;
+    }
+    if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > l.w || y + h > PANEL_H) {
+      Serial.println("{\"status\":\"error\",\"error\":\"box out of range\"}");
+      return;
+    }
     if (len == 0) {
-      panelSetImage(nullptr, 0);
+      panelSetImage(nullptr, 0, x, y, w, h);
       Serial.println("{\"status\":\"ok\",\"size\":0}");
       return;
     }
@@ -790,10 +922,10 @@ void handleSerialCommand(const String& cmd) {
     size_t received = readSerialPayload(buf, len);
     if (received != len) {
       Serial.printf("{\"status\":\"error\",\"error\":\"incomplete\",\"received\":%d,\"expected\":%d}\n", received, len);
-    } else if (buf[0] != 0xFF || buf[1] != 0xD8 || !panelSetImage(buf, len)) {
+    } else if (buf[0] != 0xFF || buf[1] != 0xD8 || !panelSetImage(buf, len, x, y, w, h)) {
       Serial.println("{\"status\":\"error\",\"error\":\"decode failed\"}");
     } else {
-      Serial.printf("{\"status\":\"ok\",\"size\":%d}\n", len);
+      Serial.printf("{\"status\":\"ok\",\"size\":%u}\n", len);
     }
     free(buf);
 
@@ -809,11 +941,26 @@ void handleSerialCommand(const String& cmd) {
     arg.trim();
     if (!panel_supported) {
       Serial.println("{\"status\":\"error\",\"error\":\"panel not supported\"}");
-    } else if (arg == "ON" || arg == "OFF" || arg == "?") {
-      if (arg != "?") panelSetOn(arg == "ON");
-      Serial.printf("{\"status\":\"ok\",\"panel\":%s}\n", panel_on ? "true" : "false");
+    } else if (arg == "?" || arg == "OFF") {
+      if (arg == "OFF") panelSetOn(false);
+      Serial.println(panelStateJson());
+    } else if (arg == "ON" || arg.startsWith("ON:")) {
+      int w = PANEL_W_DEFAULT;
+      if (arg.length() > 3) {
+        String ws = arg.substring(3);
+        bool digits = ws.length() <= 3;
+        for (size_t i = 0; i < ws.length(); i++) digits = digits && isDigit(ws[i]);
+        w = digits ? ws.toInt() : -1;
+      }
+      if (w < PANEL_W_MIN || w > PANEL_W_MAX) {
+        Serial.println("{\"status\":\"error\",\"error\":\"width must be 64..240\"}");
+      } else if (!panelSetOn(true, w)) {
+        Serial.println("{\"status\":\"error\",\"error\":\"panel alloc failed\"}");
+      } else {
+        Serial.println(panelStateJson());
+      }
     } else {
-      Serial.println("{\"status\":\"error\",\"error\":\"expected PANEL:ON|OFF|?\"}");
+      Serial.println("{\"status\":\"error\",\"error\":\"expected PANEL:ON[:<w>]|OFF|?\"}");
     }
 
   } else if (cmd.startsWith("I2C:")) {
@@ -1465,7 +1612,7 @@ void setup() {
         return;
       }
       size_t len = request->contentLength();
-      bool ok = buf[0] == 0xFF && buf[1] == 0xD8 && panelSetImage(buf, len);
+      bool ok = buf[0] == 0xFF && buf[1] == 0xD8 && panelSetArt(buf, len);
       free(buf);
       if (!ok) {
         request->send(400, "application/json", "{\"error\":\"decode failed\"}");
@@ -1513,9 +1660,9 @@ void setup() {
 #endif
 
 #ifdef ARDUINO_M5STACK_ATOMS3R
-  Serial.println("[AtomS3R+Echo] Serial commands ready: FACE:expr WAV:size VOLUME:vol IMG:size TEXT:a|b PANEL:ON|OFF|? TOUCH:? STATUS WIFI:ssid:pass CAPTURE");
+  Serial.println("[AtomS3R+Echo] Serial commands ready: FACE:expr WAV:size VOLUME:vol IMG:size TEXT:a|b PANEL:ON[:w]|OFF|? TOUCH:? STATUS WIFI:ssid:pass CAPTURE");
 #else
-  Serial.println("Serial commands ready: FACE:expr WAV:size VOLUME:vol IMG:size TEXT:a|b PANEL:ON|OFF|? TOUCH:? STATUS WIFI:ssid:pass CAPTURE");
+  Serial.println("Serial commands ready: FACE:expr WAV:size VOLUME:vol IMG:size TEXT:a|b PANEL:ON[:w]|OFF|? TOUCH:? STATUS WIFI:ssid:pass CAPTURE");
 #endif
 }
 
