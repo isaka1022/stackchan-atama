@@ -587,6 +587,33 @@ static int panelSetText(const String& text) {
 static constexpr uint32_t TOUCH_DEBOUNCE_MS = 250;
 static uint32_t touch_last_ms = 0;
 
+// Fixed-size ring drained by GET /events; the oldest entry is dropped when full.
+struct TouchEvent {
+  char zone[8];
+  int16_t x, y;
+};
+static constexpr int EVENT_QUEUE_CAP = 8;
+static TouchEvent event_queue[EVENT_QUEUE_CAP];
+static int event_head = 0;
+static int event_count = 0;
+static SemaphoreHandle_t events_mutex = nullptr;
+
+static void eventPush(const char* zone, int x, int y) {
+  if (!events_mutex) return;
+  xSemaphoreTake(events_mutex, portMAX_DELAY);
+  int idx = (event_head + event_count) % EVENT_QUEUE_CAP;
+  if (event_count == EVENT_QUEUE_CAP) {
+    event_head = (event_head + 1) % EVENT_QUEUE_CAP;
+  } else {
+    event_count++;
+  }
+  strncpy(event_queue[idx].zone, zone, sizeof(event_queue[idx].zone) - 1);
+  event_queue[idx].zone[sizeof(event_queue[idx].zone) - 1] = '\0';
+  event_queue[idx].x = (int16_t)x;
+  event_queue[idx].y = (int16_t)y;
+  xSemaphoreGive(events_mutex);
+}
+
 static void touchTick() {
   if (!M5.Touch.isEnabled() || M5.Touch.getCount() != 1) return;
   const auto& t = M5.Touch.getDetail(0);
@@ -606,6 +633,7 @@ static void touchTick() {
   else zone = "right";
   Serial.printf("{\"event\":\"touch\",\"zone\":\"%s\",\"x\":%d,\"y\":%d}\n", zone, t.x, t.y);
   Serial.flush();
+  eventPush(zone, t.x, t.y);
 }
 
 // ---- Backlight watchdog ----
@@ -843,6 +871,29 @@ void handlePanel(AsyncWebServerRequest *request) {
     }
   }
   request->send(200, "application/json", panelStateJson());
+}
+
+void handleEvents(AsyncWebServerRequest *request) {
+  JsonDocument doc;
+  doc["status"] = "ok";
+  JsonArray events = doc["events"].to<JsonArray>();
+  if (events_mutex) {
+    xSemaphoreTake(events_mutex, portMAX_DELAY);
+    for (int i = 0; i < event_count; i++) {
+      const TouchEvent& e = event_queue[(event_head + i) % EVENT_QUEUE_CAP];
+      JsonObject o = events.add<JsonObject>();
+      o["event"] = "touch";
+      o["zone"] = e.zone;
+      o["x"] = e.x;
+      o["y"] = e.y;
+    }
+    event_head = 0;
+    event_count = 0;
+    xSemaphoreGive(events_mutex);
+  }
+  String json;
+  serializeJson(doc, json);
+  request->send(200, "application/json", json);
 }
 
 void handleNotFound(AsyncWebServerRequest *request) {
@@ -1584,6 +1635,7 @@ void setup() {
 #else
   // M5Stack devices: Use default initialization with display
   avatar.init();
+  events_mutex = xSemaphoreCreateMutex();
   panelInit();
 #endif
   avatar.setExpression(Expression::Neutral);
@@ -1705,6 +1757,7 @@ void setup() {
   );
   server.on("/text", HTTP_GET, handleText);
   server.on("/panel", HTTP_GET, handlePanel);
+  server.on("/events", HTTP_GET, handleEvents);
 
   server.onNotFound(handleNotFound);
   if (wifi_connected) {
